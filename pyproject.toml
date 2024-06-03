@@ -26,8 +26,8 @@ dependencies = [
 	"geopandas>=0.13.0",
 	#fiona<1.9 does not contain sql where filter
 	"fiona>=1.9",
-	#contextily<1.0.0 is from April 2020
-	"contextily>=1.0.0",
+	#contextily<1.4.0 raises AttributeError and UnidentifiedImageError: https://github.com/Deltares/dfm_tools/issues/857
+	"contextily>=1.4.0",
 	#xarray<2023.9.0 does not support multidimensional coordinates (used in e.g. HIRLAM meteo data)
 	"xarray>=2023.9.0",
 	#dask version is aligned with xarray
@@ -44,16 +44,16 @@ dependencies = [
 	"pydap>=3.4.0",
 	#erddapy<2.0.0 does not support pandas>=2.0.0
 	"erddapy>=2.0.0",
-	#copernicusmarine<1.2.0 returns incorrect time ranges of cmems my/forecast datasets (https://github.com/Deltares/dfm_tools/issues/842)
-	"copernicusmarine>=1.2.0",
+	#copernicusmarine<1.2.1 will raise error according to copernicus (https://github.com/Deltares/dfm_tools/issues/850)
+	"copernicusmarine>=1.2.1",
 	#rws-ddlpy<0.4.0 does not yet have `ddlpy.dataframe_to_xarray()`
 	"rws-ddlpy>=0.4.0",
 	#pooch<1.1.0 do not have attribute retrieve
 	"pooch>=1.1.0",
 	#hydrolib-core 0.7.0 supports meshkernel>=4.1.0
 	"hydrolib-core>=0.7.0",
-	#meshkernel<4.1.0 does not support contacts_get, no macos support, etc
-	"meshkernel>=4.1.0",
+	#meshkernel<4.2.0 support for more gridded_samples dtypes and workarounds for non-orthogonal grids
+	"meshkernel>=4.2.0",
 ]
 classifiers = [
 	"Development Status :: 4 - Beta",
@@ -80,6 +80,7 @@ dev = [
 	"flake8",
 	"pytest",
 	"pytest-cov",
+	"pytest-timeout",
 	"twine",
 	"build",
 ]
