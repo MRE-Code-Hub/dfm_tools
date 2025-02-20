@@ -32,6 +32,8 @@ def file_to_list(file_nc):
                 return list(filter(re.compile(pattern).search, strings))
             file_nc_list = glob_re(basename, glob.glob(os.path.join(dirname,f'*{ext}')))
         else:
+            # convert to string, since glob does not support pathlib.Path
+            file_nc = str(file_nc)
             file_nc_list = glob.glob(file_nc)
         file_nc_list.sort()
     if len(file_nc_list)==0:
@@ -126,6 +128,14 @@ def preprocess_ERA5(ds):
     # https://forum.ecmwf.int/t/new-time-format-in-era5-netcdf-files/3796/5
     if 'valid_time' in ds.coords:
         ds = ds.rename({'valid_time':'time'})
+    
+    # datasets retrieved from feb 2025 onwards have different mer/mtpr varnames
+    # convert back for backwards compatibility and clarity
+    # https://github.com/Deltares/dfm_tools/issues/1140
+    if 'avg_tprate' in ds.data_vars:
+        ds = ds.rename_vars({'avg_tprate':'mtpr'})
+    if 'avg_ie' in ds.data_vars:
+        ds = ds.rename_vars({'avg_ie':'mer'})
     
     # reduce the expver dimension (not present in newly retrieved files)
     if 'expver' in ds.dims:
@@ -322,10 +332,10 @@ def convert_meteo_units(data_xr):
         print(f'converting {varkey_sel} unit from J/m2 to W/m2: [{current_unit}] to [{new_unit}]')
         data_xr[varkey_sel] = data_xr[varkey_sel] / 3600 # 3600s/h #TODO: 1W = 1J/s, so does not make sense?
         data_xr[varkey_sel].attrs['units'] = new_unit
-    #solar influx increase for beta=6%
+    #solar influx increase for beta=6% subtraction in DFM
     if 'ssr' in varkeys:
-        print('ssr (solar influx) increase for beta=6%')
-        data_xr['ssr'] = data_xr['ssr'] *.94
+        print('ssr (solar influx) increase for beta=6% subtraction in DflowFM')
+        data_xr['ssr'] = data_xr['ssr'] / 0.94
     
     return data_xr
 

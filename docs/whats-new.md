@@ -3,6 +3,19 @@
 ## UNRELEASED
 
 
+## 0.35.0 (2025-02-20)
+
+### Feat
+- add constant waterlevel offset with `dfmt.constant_to_bc()` in [#1130](https://github.com/Deltares/dfm_tools/pull/1130)
+- download GSHHS data from github instead in [#1132](https://github.com/Deltares/dfm_tools/pull/1132)
+- support multiple grid refinements via `kwargs` in`dfmt.refine_basegrid()` in [#1136](https://github.com/Deltares/dfm_tools/pull/1136)
+
+### Fix
+- correct ssr conversion factor in `convert_meteo_units()` in [#1134](https://github.com/Deltares/dfm_tools/pull/1134)
+- support for `pathlib.Path` in `file_to_list()` in [#1139](https://github.com/Deltares/dfm_tools/pull/1139)
+- rename new (feb 2025) CDS varnames `avg_ie` and `avg_tprate` back to `mer` and `mtpr` in `dfmt.preprocess_ERA5()` in [#1141](https://github.com/Deltares/dfm_tools/pull/1141)
+
+
 ## 0.34.0 (2025-02-05)
 
 ### Feat
