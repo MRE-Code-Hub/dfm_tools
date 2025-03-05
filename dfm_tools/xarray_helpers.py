@@ -1,14 +1,14 @@
 import os
 import re
 import xarray as xr
-import dask
 import datetime as dt
 import glob
 import pandas as pd
 import logging
 import numpy as np
-from dfm_tools.errors import OutOfRangeError
-
+from dfm_tools.interpolate_grid2bnd import _ds_sel_time_outside
+from scipy.ndimage import distance_transform_edt
+    
 __all__ = [
     "preprocess_hisnc",
     "preprocess_ERA5",
@@ -32,6 +32,8 @@ def file_to_list(file_nc):
                 return list(filter(re.compile(pattern).search, strings))
             file_nc_list = glob_re(basename, glob.glob(os.path.join(dirname,f'*{ext}')))
         else:
+            # convert to string, since glob does not support pathlib.Path
+            file_nc = str(file_nc)
             file_nc_list = glob.glob(file_nc)
         file_nc_list.sort()
     if len(file_nc_list)==0:
@@ -114,6 +116,12 @@ def preprocess_ERA5(ds):
     but anexpver variable is present defining whether the data comes
     from ERA5 (1) or ERA5T (5).
     
+    Adding expver coordinate if missing: The old datafiles did not contain an
+    expver variable (sometimes did contain an expver dim). The new datafiles
+    do contain an expver coordinate variable. Merging old and new files is only
+    possible if the coordinates are the same, so add a expver coordinate
+    variable to the old files with empty values.
+    
     Removing scale_factor and add_offset: In the past, the ERA5 data was
     supplied as integers with a scaling and offset that was different for
     each downloaded file. This caused serious issues with merging files,
@@ -127,9 +135,27 @@ def preprocess_ERA5(ds):
     if 'valid_time' in ds.coords:
         ds = ds.rename({'valid_time':'time'})
     
+    # datasets retrieved from feb 2025 onwards have different mer/mtpr varnames
+    # convert back for backwards compatibility and clarity
+    # https://github.com/Deltares/dfm_tools/issues/1140
+    if 'avg_tprate' in ds.data_vars:
+        ds = ds.rename_vars({'avg_tprate':'mtpr'})
+    if 'avg_ie' in ds.data_vars:
+        ds = ds.rename_vars({'avg_ie':'mer'})
+    
     # reduce the expver dimension (not present in newly retrieved files)
     if 'expver' in ds.dims:
         ds = ds.mean(dim='expver')
+    
+    # add empty expver coordinate to old files if not present to prevent
+    # "ValueError: coordinate 'expver' not present in all datasets"
+    # when merging old datasets (without expver coord) with new datasets
+    # has to be <U4 to avoid "NotImplementedError: Can not use auto rechunking
+    # with object dtype"
+    if 'expver' not in ds.variables:
+        data_expver = np.empty(shape=(len(ds.time)), dtype='<U4')
+        ds['expver'] = xr.DataArray(data=data_expver, dims='time')
+        ds = ds.set_coords('expver')
     
     # drop scaling/offset encoding if present and converting to float32. Not
     # present in newly retrieved files, variables are zipped float32 instead
@@ -155,13 +181,13 @@ def preprocess_woa(ds):
     return ds
 
 
-def merge_meteofiles(file_nc:str, preprocess=None, 
-                     time_slice:slice = slice(None,None),
-                     add_global_overlap:bool = False, zerostart:bool = False,
+def merge_meteofiles(file_nc:str,
+                     time_slice:slice,
+                     preprocess = None,
                      **kwargs) -> xr.Dataset:
     """
-    for merging for instance meteo files
-    x/y and lon/lat are renamed to longitude/latitude #TODO: is this desireable?
+    Merging of meteo files. Variables/coordinates x/y and lon/lat are renamed
+    to longitude/latitude.
 
     Parameters
     ----------
@@ -169,12 +195,8 @@ def merge_meteofiles(file_nc:str, preprocess=None,
         DESCRIPTION.
     preprocess : TYPE, optional
         DESCRIPTION. The default is None.
-    time_slice : slice, optional
-        DESCRIPTION. The default is slice(None,None).
-    add_global_overlap : bool, optional
-        GTSM specific: extend data beyond -180 to 180 longitude. The default is False.
-    zerostart : bool, optional
-        GTSM specific: extend data with 0-value fields 1 and 2 days before time_slice.start. The default is False.
+    time_slice : slice
+        slice(tstart,tstop).
     kwargs : dict, optional
         arguments for xr.open_mfdataset() like `chunks` to prevent large chunks and resulting memory issues.
 
@@ -185,28 +207,35 @@ def merge_meteofiles(file_nc:str, preprocess=None,
 
     """
     #TODO: add ERA5 conversions and features from hydro_tools\ERA5\ERA52DFM.py (except for varRhoair_alt, request FM support for varying airpressure: https://issuetracker.deltares.nl/browse/UNST-6593)
-    #TODO: provide extfile example with fmquantity/ncvarname combinations and cleanup FM code: https://issuetracker.deltares.nl/browse/UNST-6453
     #TODO: add coordinate conversion (only valid for models with multidimensional lat/lon variables like HARMONIE and HIRLAM). This should work: ds_reproj = ds.set_crs(4326).to_crs(28992)
     #TODO: add CMCC etc from gtsmip repos (mainly calendar conversion)
-    #TODO: put conversions in separate function?
     #TODO: maybe add renaming like {'salinity':'so', 'water_temp':'thetao'} for hycom
        
-    #woa workaround
+    # woa workaround
     if preprocess == preprocess_woa:
         decode_cf = False
     else:
         decode_cf = True        
 
-    file_nc_list = file_to_list(file_nc)
+    if 'chunks' not in kwargs:
+        # enable dask chunking
+        kwargs['chunks'] = 'auto'
+    if 'data_vars' not in kwargs:
+        # avoid time dimension on other variables
+        # enforce error in case of conflicting variables
+        kwargs['data_vars'] = 'minimal'
+    if 'join' not in kwargs:
+        # forbid slightly changed lat/lon values
+        # enforce alignment error if expver is not present in all datasets 
+        kwargs['join'] = 'exact'
 
+    file_nc_list = file_to_list(file_nc)
     print(f'>> opening multifile dataset of {len(file_nc_list)} files (can take a while with lots of files): ',end='')
     dtstart = dt.datetime.now()
-    with dask.config.set(**{'array.slicing.split_large_chunks': True}):
-        # using dask option to avoid large chunks which speeds up the merging/writing process
-        data_xr = xr.open_mfdataset(file_nc_list,
-                                    preprocess=preprocess,
-                                    decode_cf=decode_cf,
-                                    **kwargs)
+    data_xr = xr.open_mfdataset(file_nc_list,
+                                preprocess=preprocess,
+                                decode_cf=decode_cf,
+                                **kwargs)
     print(f'{(dt.datetime.now()-dtstart).total_seconds():.2f} sec')
     
     # rename variables
@@ -219,28 +248,28 @@ def merge_meteofiles(file_nc:str, preprocess=None,
         else:
             raise KeyError('no longitude/latitude, lon/lat or x/y variables found in dataset')
     
-    # select time and do checks
-    # TODO: check if calendar is standard/gregorian
-    data_xr = data_xr.sel(time=time_slice)
+    # check for duplicated timesteps
     if data_xr.get_index('time').duplicated().any():
         print('dropping duplicate timesteps')
-        data_xr = data_xr.sel(time=~data_xr.get_index('time').duplicated()) #drop duplicate timesteps
+        # drop duplicate timesteps
+        data_xr = data_xr.sel(time=~data_xr.get_index('time').duplicated())
     
-    #check if there are times selected
-    if len(data_xr.time)==0:
-        raise OutOfRangeError(f'ERROR: no times selected, ds_text={data_xr.time[[0,-1]].to_numpy()} and time_slice={time_slice}')
+    # TODO: check if calendar is standard/gregorian
+    # check available times and select outside bounds
+    data_xr = _ds_sel_time_outside(
+        data_xr,
+        tstart=time_slice.start,
+        tstop=time_slice.stop,
+        )
     
     #check if there are no gaps (more than one unique timestep)
     times_pd = data_xr['time'].to_series()
     timesteps_uniq = times_pd.diff().iloc[1:].unique()
     if len(timesteps_uniq)>1:
-        raise Exception(f'ERROR: gaps found in selected dataset (are there sourcefiles missing?), unique timesteps (hour): {timesteps_uniq/1e9/3600}')
-    
-    #check if requested times are available in selected files (in times_pd)
-    if time_slice.start not in times_pd.index:
-        raise OutOfRangeError(f'ERROR: time_slice_start="{time_slice.start}" not in selected files, timerange: "{times_pd.index[0]}" to "{times_pd.index[-1]}"')
-    if time_slice.stop not in times_pd.index:
-        raise OutOfRangeError(f'ERROR: time_slice_stop="{time_slice.stop}" not in selected files, timerange: "{times_pd.index[0]}" to "{times_pd.index[-1]}"')
+        raise ValueError(
+            'time gaps found in selected dataset (missing files?), '
+            f'unique timesteps (hour): {timesteps_uniq/1e9/3600}'
+            )
     
     data_xr = convert_meteo_units(data_xr)
     
@@ -250,30 +279,13 @@ def merge_meteofiles(file_nc:str, preprocess=None,
         lon_newvar = (data_xr.coords['longitude'] + 180) % 360 - 180
         data_xr.coords['longitude'] = lon_newvar.assign_attrs(data_xr['longitude'].attrs) #this re-adds original attrs
         data_xr = data_xr.sortby(data_xr['longitude'])
-    
-    #GTSM specific addition for longitude overlap
-    if add_global_overlap: # assumes -180 to ~+179.75 (full global extent, but no overlap). Does not seem to mess up results for local models.
-        if len(data_xr.longitude.values) != len(np.unique(data_xr.longitude.values%360)):
-            raise Exception(f'add_global_overlap=True, but there are already overlapping longitude values: {data_xr.longitude}')
-        overlap_ltor = data_xr.sel(longitude=data_xr.longitude<=-179)
-        overlap_ltor['longitude'] = overlap_ltor['longitude'] + 360
-        overlap_rtol = data_xr.sel(longitude=data_xr.longitude>=179)
-        overlap_rtol['longitude'] = overlap_rtol['longitude'] - 360
-        data_xr = xr.concat([data_xr,overlap_ltor,overlap_rtol],dim='longitude').sortby('longitude')
-    
-    # GTSM specific addition for zerovalues during spinup
-    # doing this drops all encoding from variables, causing them to be converted into floats
-    if zerostart:
-        field_zerostart = data_xr.isel(time=[0,0])*0 #two times first field, set values to 0
-        field_zerostart['time'] = [times_pd.index[0]-dt.timedelta(days=2),times_pd.index[0]-dt.timedelta(days=1)] #TODO: is one zero field not enough? (is replacing first field not also ok? (results in 1hr transition period)
-        data_xr = xr.concat([field_zerostart,data_xr],dim='time',combine_attrs='no_conflicts') #combine_attrs argument prevents attrs from being dropped
-    
+
     return data_xr
 
 
 def convert_meteo_units(data_xr):
-    
     #TODO: check conversion implementation with hydro_tools\ERA5\ERA52DFM.py
+    #TODO: assert old unit instead of always converting
     #TODO: keep/update attrs
     #TODO: reduce code complexity
     
@@ -322,10 +334,10 @@ def convert_meteo_units(data_xr):
         print(f'converting {varkey_sel} unit from J/m2 to W/m2: [{current_unit}] to [{new_unit}]')
         data_xr[varkey_sel] = data_xr[varkey_sel] / 3600 # 3600s/h #TODO: 1W = 1J/s, so does not make sense?
         data_xr[varkey_sel].attrs['units'] = new_unit
-    #solar influx increase for beta=6%
+    #solar influx increase for beta=6% subtraction in DFM
     if 'ssr' in varkeys:
-        print('ssr (solar influx) increase for beta=6%')
-        data_xr['ssr'] = data_xr['ssr'] *.94
+        print('ssr (solar influx) increase for beta=6% subtraction in DflowFM')
+        data_xr['ssr'] = data_xr['ssr'] / 0.94
     
     return data_xr
 
@@ -346,3 +358,30 @@ def Dataset_varswithdim(ds,dimname): #TODO: dit zit ook in xugrid, wordt nu gebr
     return ds
 
 
+def _nearest(a):
+    nans = np.isnan(a)
+    if not nans.any():
+        return a.copy()
+    indices = distance_transform_edt(
+        input=np.isnan(a),
+        return_distances=False,
+        return_indices=True,
+    )
+    return a[tuple(indices)]
+
+
+def interpolate_na_multidim(da, dim, keep_attrs=True):
+    """
+    Interpolate_na for multiple dimensions at once. Since it 
+    """
+    arr = xr.apply_ufunc(
+        _nearest,
+        da,
+        input_core_dims=[dim],
+        output_core_dims=[dim],
+        output_dtypes=[da.dtype],
+        dask="parallelized",
+        vectorize=True,
+        keep_attrs=keep_attrs,
+    ).transpose(*da.dims)
+    return arr
